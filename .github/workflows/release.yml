@@ -13,6 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check tag matches Cargo.toml version
+        run: |
+          VERSION="$(cargo pkgid | sed 's/.*#//')"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION" >&2
+            exit 1
+          fi
+
       - name: Install targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
