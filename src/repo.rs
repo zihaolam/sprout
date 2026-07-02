@@ -1,7 +1,7 @@
 //! Git plumbing and path layout.
 //!
-//! Worktrees live at `~/.sprout/{slug}/{name}` where `slug` is
-//! `{repo-dir-name}-{fnv1a(main repo path)}` — readable, collision-free.
+//! Worktrees live at `{repo}/.sprout/{name}`, inside the project itself —
+//! always on the repo's volume (a clonefile requirement) and easy to find.
 
 use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
@@ -63,35 +63,45 @@ pub fn main_repo_root(worktree_root: &Path) -> Result<PathBuf> {
         .context("could not determine main repository root")
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
+/// `{main_root}/.sprout` — this repository's worktree namespace.
+pub fn repo_namespace(main_root: &Path) -> PathBuf {
+    main_root.join(".sprout")
 }
 
-/// `~/.sprout/{repo-dir-name}-{hash}` for this repository.
-pub fn repo_namespace(main_root: &Path) -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let canonical = main_root
-        .canonicalize()
-        .unwrap_or_else(|_| main_root.to_path_buf());
-    let dir_name = canonical
-        .file_name()
-        .context("repository root has no name")?
-        .to_string_lossy()
-        .to_string();
-    let hash = fnv1a(canonical.as_os_str().as_encoded_bytes());
-    Ok(PathBuf::from(home)
-        .join(".sprout")
-        .join(format!("{dir_name}-{hash:08x}")))
+/// Make sure git ignores `.sprout/` so worktrees never show up as untracked
+/// state or leak into a commit. Written to `.git/info/exclude` — repo-local,
+/// the user's .gitignore stays untouched.
+pub fn ensure_sprout_excluded(main_root: &Path) -> Result<()> {
+    let ignored = Command::new("git")
+        .arg("-C")
+        .arg(main_root)
+        .args(["check-ignore", "-q", ".sprout"])
+        .status()
+        .context("failed to spawn git")?
+        .success();
+    if ignored {
+        return Ok(());
+    }
+    let common = git(
+        main_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let exclude = Path::new(&common).join("info").join("exclude");
+    if let Some(parent) = exclude.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)?;
+    writeln!(f, "/.sprout/")?;
+    Ok(())
 }
 
 /// Destination directory for a named worktree. Slashes in the branch name
 /// become nested directories, mirroring how git stores refs
-/// (`feat/foo` → `~/.sprout/{slug}/feat/foo`).
+/// (`feat/foo` → `{repo}/.sprout/feat/foo`).
 pub fn worktree_dir(main_root: &Path, name: &str) -> Result<PathBuf> {
     // Delegate name validation to git itself: rejects "..", leading dots,
     // empty components, trailing slashes, control chars, etc. This is what
@@ -105,7 +115,7 @@ pub fn worktree_dir(main_root: &Path, name: &str) -> Result<PathBuf> {
     if !ok {
         bail!("'{name}' is not a valid branch name");
     }
-    Ok(repo_namespace(main_root)?.join(name))
+    Ok(repo_namespace(main_root).join(name))
 }
 
 /// After removing a nested worktree (e.g. `feat/foo`), prune now-empty
@@ -152,6 +162,9 @@ pub fn ignored_entries(worktree_root: &Path) -> Result<Vec<PathBuf>> {
             let e = e.strip_suffix(b"/").unwrap_or(e);
             PathBuf::from(OsStr::from_bytes(e))
         })
+        // `.sprout` holds the other worktrees and is itself git-ignored;
+        // cloning it would copy every existing worktree into the new one.
+        .filter(|p| p != Path::new(".sprout"))
         .collect();
     Ok(dedupe_nested(entries))
 }

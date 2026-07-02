@@ -1,8 +1,7 @@
 //! Integration tests: run the real binary against throwaway repos.
 //!
-//! Each test gets its own temp dir used both as the repo parent and as HOME,
-//! so worktrees land in <tmp>/home/.sprout and never touch the real one.
-//! Both live on the same APFS volume, which clonefile requires.
+//! Each test gets its own temp repo; worktrees land in <repo>/.sprout,
+//! which is on the same APFS volume by construction (clonefile requires it).
 
 use std::fs;
 use std::path::PathBuf;
@@ -20,6 +19,9 @@ impl TestEnv {
     fn new() -> Self {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!("sprout-test-{}-{id}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        // macOS temp_dir is /var/..., a symlink; git reports /private/var/...
+        let root = root.canonicalize().unwrap();
         let repo = root.join("repo");
         fs::create_dir_all(&repo).unwrap();
         let env = TestEnv { root, repo };
@@ -104,7 +106,7 @@ fn new_clones_ignored_state_and_stdout_is_only_the_path() {
     // stdout contract: exactly one line, the worktree path
     assert_eq!(stdout.lines().count(), 1, "stdout must be only the path");
     let wt = PathBuf::from(&stdout);
-    assert!(wt.starts_with(env.root.join(".sprout")));
+    assert!(wt.starts_with(env.repo.join(".sprout")));
 
     // tracked files via git worktree, ignored state via clonefile
     assert!(wt.join("src/lib.ts").is_file());
@@ -188,7 +190,7 @@ fn slashed_branch_names_nest_and_invalid_names_are_rejected() {
     }
     // nothing escaped the namespace
     assert!(!env.root.join("evil").exists());
-    assert!(!env.root.join(".sprout").join("..").join("evil").exists());
+    assert!(!env.repo.join("evil").exists());
 }
 
 #[test]
@@ -204,9 +206,39 @@ fn rm_guards_dirty_tracked_files_and_prunes_empty_parents() {
 
     env.sprout_ok(&["rm", "feat/x", "--force"]);
     assert!(!wt.exists());
-    // empty `feat/` parent pruned, namespace itself kept
+    // empty `feat/` parent pruned, and `.sprout` itself goes with the
+    // last worktree — no empty dir left lying around in the project
     assert!(!wt.parent().unwrap().exists());
-    assert!(env.root.join(".sprout").is_dir());
+    assert!(!env.repo.join(".sprout").exists());
+}
+
+#[test]
+fn sprout_dir_is_git_excluded_and_never_cloned_into_worktrees() {
+    let env = TestEnv::new();
+    env.sprout_ok(&["new", "feat"]);
+
+    // .sprout was auto-added to .git/info/exclude: status stays clean
+    let out = Command::new("git")
+        .current_dir(&env.repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        ".sprout must not show up as untracked state"
+    );
+    // repeated runs must not duplicate the exclude entry
+    env.sprout_ok(&["new", "feat2"]);
+    let exclude = fs::read_to_string(env.repo.join(".git/info/exclude")).unwrap();
+    assert_eq!(exclude.matches("/.sprout/").count(), 1);
+
+    // a new worktree must never contain the other worktrees
+    let wt2 = PathBuf::from(env.sprout_ok(&["path", "feat2"]));
+    assert!(
+        !wt2.join(".sprout").exists(),
+        "worktrees must not nest recursively"
+    );
 }
 
 #[test]

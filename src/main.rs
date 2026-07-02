@@ -1,4 +1,5 @@
 mod clonefile;
+mod progress;
 mod repo;
 mod scrub;
 
@@ -70,6 +71,7 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
     if dest.exists() {
         bail!("worktree already exists at {}", dest.display());
     }
+    repo::ensure_sprout_excluded(&main_root)?;
     fs::create_dir_all(dest.parent().context("destination has no parent")?)?;
 
     // 1. Worktree: git carries tracked files + shares objects/refs.
@@ -85,30 +87,36 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
         eprintln!("{out}");
     }
 
-    // 2. CoW-clone everything git ignores (node_modules, caches, .env, ...).
+    // 2. CoW-clone everything git ignores (node_modules, caches, .env, ...),
+    //    with a spinner on stderr so slow clones don't look frozen.
     let started = Instant::now();
     let entries = repo::ignored_entries(&source)?;
-    let mut cloned = 0u64;
-    let mut failed = 0u64;
-    for rel in &entries {
-        let src = source.join(rel);
-        let dst = dest.join(rel);
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match clonefile::clone(&src, &dst) {
-            Ok(()) => cloned += 1,
-            // Already present — e.g. carried along when a parent was cloned.
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => {
-                failed += 1;
-                let hint = clonefile::explain(&err)
-                    .map(|h| format!(" ({h})"))
-                    .unwrap_or_default();
-                eprintln!("warn: could not clone {}: {err}{hint}", rel.display());
+    let (cloned, failed) = progress::with_spinner(entries.len(), |p| -> Result<(u64, u64)> {
+        let mut cloned = 0u64;
+        let mut failed = 0u64;
+        for rel in &entries {
+            p.set(rel.display());
+            let src = source.join(rel);
+            let dst = dest.join(rel);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
             }
+            match clonefile::clone(&src, &dst) {
+                Ok(()) => cloned += 1,
+                // Already present — e.g. carried along when a parent was cloned.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    failed += 1;
+                    let hint = clonefile::explain(&err)
+                        .map(|h| format!(" ({h})"))
+                        .unwrap_or_default();
+                    p.warn(format!("warn: could not clone {}: {err}{hint}", rel.display()));
+                }
+            }
+            p.inc();
         }
-    }
+        Ok((cloned, failed))
+    })?;
 
     // 3. Scrub whatever .sproutignore says to drop.
     let mut scrubbed = 0u64;
@@ -161,7 +169,10 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
 
     let dest_str = dest.to_string_lossy();
     repo::git_passthrough(&source, &["worktree", "remove", "--force", &dest_str])?;
-    repo::prune_empty_parents(&repo::repo_namespace(&main_root)?, &dest);
+    let namespace = repo::repo_namespace(&main_root);
+    repo::prune_empty_parents(&namespace, &dest);
+    // Drop `.sprout` itself once the last worktree is gone (fails if non-empty).
+    let _ = fs::remove_dir(&namespace);
     eprintln!("removed {}", dest.display());
     Ok(())
 }

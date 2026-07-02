@@ -59,8 +59,13 @@ the worktree you run `sprout new` from: `node_modules` at every level, build
 output, caches, `.env` files. Tracked files are handled by `git worktree add`
 (shared objects and refs, independent HEAD/index).
 
-Worktrees live at `~/.sprout/{repo-name}-{hash}/{worktree-name}`. The hash is
-derived from the main repo path, so identically-named repos don't collide.
+Worktrees live at `{repo}/.sprout/{worktree-name}`, inside the project itself.
+sprout adds `/.sprout/` to `.git/info/exclude` automatically, so git never
+sees them as untracked state and your `.gitignore` stays untouched. Removing
+the last worktree removes the `.sprout` directory too.
+
+One caveat of the in-project location: `git clean -fdx` in the main checkout
+would delete `.sprout` along with everything else git ignores.
 
 ## .sproutignore
 
