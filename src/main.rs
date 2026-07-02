@@ -98,6 +98,8 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
         }
         match clonefile::clone(&src, &dst) {
             Ok(()) => cloned += 1,
+            // Already present — e.g. carried along when a parent was cloned.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => {
                 failed += 1;
                 let hint = clonefile::explain(&err)

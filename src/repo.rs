@@ -143,7 +143,7 @@ pub fn ignored_entries(worktree_root: &Path) -> Result<Vec<PathBuf>> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(out
+    let entries = out
         .stdout
         .split(|b| *b == 0)
         .filter(|e| !e.is_empty())
@@ -152,7 +152,26 @@ pub fn ignored_entries(worktree_root: &Path) -> Result<Vec<PathBuf>> {
             let e = e.strip_suffix(b"/").unwrap_or(e);
             PathBuf::from(OsStr::from_bytes(e))
         })
-        .collect())
+        .collect();
+    Ok(dedupe_nested(entries))
+}
+
+/// `git ls-files --directory` can emit both an ignored directory and paths
+/// inside it (seen in real monorepos with nested ignore rules and symlinked
+/// package dirs). Cloning the parent already carries the children, so drop
+/// every entry nested under another.
+fn dedupe_nested(mut entries: Vec<PathBuf>) -> Vec<PathBuf> {
+    // Sorting guarantees a parent sorts before all of its descendants.
+    entries.sort();
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(entries.len());
+    for e in entries {
+        // Path::starts_with is component-wise, so `a/b-x` does NOT match
+        // `a/b` — only real ancestors (and exact duplicates) are dropped.
+        if !kept.iter().any(|k| e.starts_with(k)) {
+            kept.push(e);
+        }
+    }
+    kept
 }
 
 pub fn branch_exists(root: &Path, name: &str) -> bool {
@@ -166,4 +185,38 @@ pub fn branch_exists(root: &Path, name: &str) -> bool {
         ],
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_nested;
+    use std::path::PathBuf;
+
+    fn paths(v: &[&str]) -> Vec<PathBuf> {
+        v.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn drops_children_duplicates_keeps_lookalike_siblings() {
+        // Shape observed in a real pnpm monorepo: parent dirs emitted
+        // together with entries nested inside them.
+        let got = dedupe_nested(paths(&[
+            "apps/chrome-extension/dist",
+            "apps/chrome-extension/dist/assets", // child of an entry
+            "apps/chrome-extension/dist-x",      // sibling that shares the prefix string
+            "packages/api/packages/api",
+            "packages/api/packages/api/node_modules", // child
+            "packages/api/packages/api",              // exact duplicate
+            "node_modules",
+        ]));
+        assert_eq!(
+            got,
+            paths(&[
+                "apps/chrome-extension/dist",
+                "apps/chrome-extension/dist-x",
+                "node_modules",
+                "packages/api/packages/api",
+            ])
+        );
+    }
 }
