@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Test
+        run: cargo test
+
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output sprout \
+            target/aarch64-apple-darwin/release/sprout \
+            target/x86_64-apple-darwin/release/sprout
+          ./sprout --version
+
+      - name: Package
+        run: |
+          # Unversioned asset name so the stable URL
+          # releases/latest/download/<asset> always works.
+          tar -czf sprout-universal-apple-darwin.tar.gz sprout
+          shasum -a 256 sprout-universal-apple-darwin.tar.gz > checksums.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --generate-notes \
+            sprout-universal-apple-darwin.tar.gz \
+            checksums.txt
