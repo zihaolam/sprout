@@ -25,7 +25,7 @@ enum Cmd {
     New {
         /// Branch / worktree name
         name: String,
-        /// Base ref when creating a new branch (defaults to HEAD)
+        /// Base ref when creating a new branch (defaults to the repo's default branch, e.g. main)
         #[arg(long)]
         base: Option<String>,
     },
@@ -44,7 +44,7 @@ enum Cmd {
     /// With shell integration installed, this cd's into it.
     Switch {
         name: String,
-        /// Base ref if a new branch is created (defaults to HEAD)
+        /// Base ref if a new branch is created (defaults to the repo's default branch, e.g. main)
         #[arg(long)]
         base: Option<String>,
     },
@@ -80,8 +80,10 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
     let out = if repo::branch_exists(&source, name) {
         repo::git(&source, &["worktree", "add", &dest_str, name])?
     } else {
-        let base = base.unwrap_or("HEAD");
-        repo::git(&source, &["worktree", "add", "-b", name, &dest_str, base])?
+        let base = base
+            .map(String::from)
+            .unwrap_or_else(|| repo::default_base(&source));
+        repo::git(&source, &["worktree", "add", "-b", name, &dest_str, &base])?
     };
     if !out.is_empty() {
         eprintln!("{out}");

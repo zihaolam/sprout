@@ -251,6 +251,23 @@ fn rm_allows_worktree_with_untracked_files_when_tracked_clean() {
 }
 
 #[test]
+fn new_branches_from_default_branch_not_current_branch() {
+    let env = TestEnv::new();
+    // Diverge on another branch: `main` still has x = 1, `other` has x = 999.
+    env.git(&["checkout", "-qb", "other"]);
+    env.write("src/lib.ts", "export const x = 999\n");
+    env.git(&["commit", "-qam", "other work"]);
+
+    // Invoked from `other`, a new worktree must still branch off `main`.
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    let content = fs::read_to_string(wt.join("src/lib.ts")).unwrap();
+    assert_eq!(
+        content, "export const x = 1\n",
+        "new branch must be created from main, not the current branch"
+    );
+}
+
+#[test]
 fn base_flag_branches_from_ref() {
     let env = TestEnv::new();
     env.write("src/lib.ts", "export const x = 2\n");

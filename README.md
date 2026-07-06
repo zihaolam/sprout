@@ -28,13 +28,19 @@ with `SPROUT_VERSION=v0.1.0`, change the destination with
 
 ```sh
 sprout new feat/login            # worktree + clone ignored state, prints path
-sprout new feat/login --base v2  # branch off a ref instead of HEAD
+sprout new feat/login --base v2  # branch off a ref instead of the default branch
 sprout switch feat/login         # print path, creating the worktree if needed
 cd "$(sprout path feat/login)"   # jump to it
 sprout list                      # git worktree list
 sprout rm feat/login             # refuses if tracked files are dirty
 sprout rm feat/login --force
 ```
+
+New branches are created from the repo's default branch (`main`, else
+`master`, else `origin/HEAD`) — not whatever branch you're currently on — so a
+new worktree always starts clean from mainline. Use `--base <ref>` to branch
+off anything else. Naming an existing branch checks it out as-is; `--base` only
+applies when a new branch is created.
 
 `cd "$(sprout new feat/login)"` also works — the path is the only thing on
 stdout. Slashed branch names nest, mirroring git's own ref storage.

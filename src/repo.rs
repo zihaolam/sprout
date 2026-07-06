@@ -200,6 +200,25 @@ pub fn branch_exists(root: &Path, name: &str) -> bool {
     .is_ok()
 }
 
+/// The ref a new branch is created from when `--base` isn't given: the repo's
+/// default branch, so worktrees start from `main` regardless of which branch
+/// you happen to be on. Prefers a local `main`, then `master`, then the
+/// remote's default (`origin/HEAD`), and falls back to `main`.
+pub fn default_base(root: &Path) -> String {
+    for b in ["main", "master"] {
+        if branch_exists(root, b) {
+            return b.to_string();
+        }
+    }
+    // e.g. "origin/HEAD" -> "origin/main"; a valid ref to branch from.
+    if let Ok(sym) = git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        && !sym.is_empty()
+    {
+        return sym;
+    }
+    "main".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::dedupe_nested;
