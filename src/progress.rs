@@ -84,6 +84,37 @@ pub fn with_spinner<T>(total: usize, work: impl FnOnce(&Reporter) -> T) -> T {
     })
 }
 
+/// Run `work` while an indeterminate spinner with a fixed message animates on
+/// stderr. For operations with no per-item count to report — e.g.
+/// `git worktree remove` deleting a whole cloned tree in one call. Falls back
+/// to running `work` untouched when stderr isn't a TTY.
+pub fn with_message<T>(msg: &str, work: impl FnOnce() -> T) -> T {
+    if !io::stderr().is_terminal() {
+        return work();
+    }
+    let stop = AtomicBool::new(false);
+    thread::scope(|s| {
+        s.spawn(|| {
+            let mut frame = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                {
+                    let mut err = io::stderr().lock();
+                    let _ = write!(err, "\r\x1b[K{} {msg}", FRAMES[frame % FRAMES.len()]);
+                    let _ = err.flush();
+                }
+                frame += 1;
+                thread::sleep(TICK);
+            }
+            let mut err = io::stderr().lock();
+            let _ = write!(err, "\r\x1b[K");
+            let _ = err.flush();
+        });
+        let out = work();
+        stop.store(true, Ordering::Relaxed);
+        out
+    })
+}
+
 fn animate(r: &Reporter) {
     let mut frame = 0usize;
     while !r.stop.load(Ordering::Relaxed) {

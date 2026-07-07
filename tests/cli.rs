@@ -268,6 +268,28 @@ fn new_branches_from_default_branch_not_current_branch() {
 }
 
 #[test]
+fn main_prints_main_worktree_from_anywhere() {
+    let env = TestEnv::new();
+    // From the main checkout, `main` prints the main checkout itself.
+    assert_eq!(env.sprout_ok(&["main"]), env.repo.to_string_lossy());
+
+    // From inside a linked worktree, `main` still points back to the main
+    // checkout — not the worktree you're standing in.
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    let from_wt = Command::new(env!("CARGO_BIN_EXE_sprout"))
+        .current_dir(&wt)
+        .env("HOME", &env.root)
+        .args(["main"])
+        .output()
+        .unwrap();
+    assert!(from_wt.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&from_wt.stdout).trim(),
+        env.repo.to_string_lossy(),
+    );
+}
+
+#[test]
 fn base_flag_branches_from_ref() {
     let env = TestEnv::new();
     env.write("src/lib.ts", "export const x = 2\n");
@@ -275,6 +297,116 @@ fn base_flag_branches_from_ref() {
     let wt = PathBuf::from(env.sprout_ok(&["new", "old", "--base", "HEAD~1"]));
     let content = fs::read_to_string(wt.join("src/lib.ts")).unwrap();
     assert_eq!(content, "export const x = 1\n", "checked out from HEAD~1");
+}
+
+/// Give the repo a `development` branch whose lib.ts differs from main's, so
+/// tests can tell which base a new worktree was cut from.
+fn add_development_branch(env: &TestEnv) {
+    env.git(&["checkout", "-qb", "development"]);
+    env.write("src/lib.ts", "export const x = 99\n");
+    env.git(&["commit", "-qam", "development work"]);
+    env.git(&["checkout", "-q", "main"]);
+}
+
+#[test]
+fn config_json_sets_default_base() {
+    let env = TestEnv::new();
+    add_development_branch(&env);
+    // Without config, `new` would branch from main (x = 1); the config redirects
+    // the default to development (x = 99).
+    env.write(".sprout/config.json", "{\n  \"base\": \"development\"\n}\n");
+
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    let content = fs::read_to_string(wt.join("src/lib.ts")).unwrap();
+    assert_eq!(
+        content, "export const x = 99\n",
+        "new branch must be created from the configured base 'development'"
+    );
+}
+
+#[test]
+fn base_flag_overrides_config_default() {
+    let env = TestEnv::new();
+    add_development_branch(&env);
+    env.write(".sprout/config.json", "{\"base\": \"development\"}\n");
+
+    // Explicit --base wins over the configured default.
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat", "--base", "main"]));
+    let content = fs::read_to_string(wt.join("src/lib.ts")).unwrap();
+    assert_eq!(
+        content, "export const x = 1\n",
+        "--base must override .sprout/config.json"
+    );
+}
+
+#[test]
+fn malformed_config_is_a_clear_error() {
+    let env = TestEnv::new();
+    env.write(".sprout/config.json", "{ not valid json");
+    let out = env.sprout(&["new", "feat"]);
+    assert!(!out.status.success(), "malformed config must fail loudly");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("config.json"), "error must name the file: {stderr}");
+}
+
+#[test]
+fn explicit_base_on_existing_branch_warns_and_checks_out_as_is() {
+    let env = TestEnv::new();
+    add_development_branch(&env);
+    // `feat` already exists, pointing at main.
+    env.git(&["branch", "feat", "main"]);
+
+    let out = env.sprout(&["switch", "feat", "--base", "development"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("ignoring --base"),
+        "must warn that --base was ignored: {stderr}"
+    );
+    // Checked out the existing branch (main's content), not development's.
+    let wt = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let content = fs::read_to_string(wt.join("src/lib.ts")).unwrap();
+    assert_eq!(content, "export const x = 1\n", "existing branch checked out as-is");
+}
+
+#[test]
+fn configured_base_on_existing_branch_warns() {
+    let env = TestEnv::new();
+    add_development_branch(&env);
+    env.write(".sprout/config.json", "{\"base\": \"development\"}\n");
+    // `feat` already exists (from main); no --base flag, just the config default.
+    env.git(&["branch", "feat", "main"]);
+
+    let out = env.sprout(&["switch", "feat"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("configured base"),
+        "must warn the configured base was not applied: {stderr}"
+    );
+}
+
+#[test]
+fn ls_is_an_alias_for_list() {
+    let env = TestEnv::new();
+    env.sprout_ok(&["new", "feat"]);
+    let list = env.sprout_ok(&["list"]);
+    let ls = env.sprout_ok(&["ls"]);
+    assert_eq!(ls, list, "`ls` must behave exactly like `list`");
+    assert!(ls.contains("feat"), "worktree should appear in output");
+}
+
+#[test]
+fn explicit_base_on_existing_worktree_warns() {
+    let env = TestEnv::new();
+    env.sprout_ok(&["switch", "feat"]); // create the worktree once
+    let out = env.sprout(&["switch", "feat", "--base", "development"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("ignoring --base"),
+        "must warn --base is ignored when the worktree exists: {stderr}"
+    );
 }
 
 #[test]

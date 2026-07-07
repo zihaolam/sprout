@@ -31,32 +31,43 @@ sprout new feat/login            # worktree + clone ignored state, prints path
 sprout new feat/login --base v2  # branch off a ref instead of the default branch
 sprout switch feat/login         # print path, creating the worktree if needed
 cd "$(sprout path feat/login)"   # jump to it
-sprout list                      # git worktree list
+sprout main                      # jump back to the main worktree
+sprout list                      # git worktree list (alias: sprout ls)
 sprout rm feat/login             # refuses if tracked files are dirty
 sprout rm feat/login --force
 ```
 
+Interrupting a `new`/`switch` with Ctrl-C tears the half-built worktree back
+down instead of leaving a partial tree behind — so you never end up `cd`'d
+into an incomplete checkout. Press it again to hard-quit.
+
 New branches are created from the repo's default branch (`main`, else
 `master`, else `origin/HEAD`) — not whatever branch you're currently on — so a
 new worktree always starts clean from mainline. Use `--base <ref>` to branch
-off anything else. Naming an existing branch checks it out as-is; `--base` only
-applies when a new branch is created.
+off anything else, or set a per-repo default in
+[`.sprout/config.json`](#default-branch).
+
+`--base` only takes effect when a **new** branch is actually created. If you
+name an existing branch (or an existing worktree), sprout checks it out as-is
+and warns that `--base` was ignored — a branch's starting point is fixed when
+it's first created. To recut an existing branch from a different base, delete
+it first (or pick a new name).
 
 `cd "$(sprout new feat/login)"` also works — the path is the only thing on
 stdout. Slashed branch names nest, mirroring git's own ref storage.
 
 ### Shell integration
 
-A CLI can't change its parent shell's directory, so `sprout new` /
-`sprout switch` print the path instead. To land in the worktree
-automatically, add this to `~/.zshrc` (works in bash too):
+A CLI can't change its parent shell's directory, so `sprout new`,
+`sprout switch`, and `sprout main` print the path instead. To land in the
+worktree automatically, add this to `~/.zshrc` (works in bash too):
 
 ```sh
 eval "$(sprout shell-init)"
 ```
 
 Then `sprout switch feat/login` creates the worktree if needed and cd's into
-it.
+it, and `sprout main` drops you back in the main checkout.
 
 ## What gets cloned
 
@@ -72,6 +83,27 @@ the last worktree removes the `.sprout` directory too.
 
 One caveat of the in-project location: `git clean -fdx` in the main checkout
 would delete `.sprout` along with everything else git ignores.
+
+## Default branch
+
+By default `sprout new`/`switch` cut new branches from the auto-detected
+mainline (`main`, else `master`, else `origin/HEAD`). To point a repo at a
+different default — say your team works off `development` — drop a
+`.sprout/config.json` in the repo:
+
+```json
+{ "base": "development" }
+```
+
+It lives in the git-ignored `.sprout/` directory, so it's personal to your
+checkout and never committed. The base is resolved in this order:
+
+```
+--base <ref>   >   .sprout/config.json   >   main / master / origin/HEAD
+```
+
+(A malformed `config.json`, or a non-string `base`, is a hard error rather than
+a silent fallback — so a typo never quietly does nothing.)
 
 ## .sproutignore
 
