@@ -187,6 +187,25 @@ fn dedupe_nested(mut entries: Vec<PathBuf>) -> Vec<PathBuf> {
     kept
 }
 
+/// Delete a local branch. `force` maps to `git branch -D` (drop even if the
+/// branch isn't fully merged); otherwise `-d`, which refuses unmerged branches.
+/// On failure returns git's own trimmed stderr, so the caller can surface
+/// exactly why (unmerged, or still checked out elsewhere).
+pub fn delete_branch(main_root: &Path, name: &str, force: bool) -> std::result::Result<(), String> {
+    let flag = if force { "-D" } else { "-d" };
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(main_root)
+        .args(["branch", flag, name])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 pub fn branch_exists(root: &Path, name: &str) -> bool {
     git(
         root,
@@ -200,6 +219,37 @@ pub fn branch_exists(root: &Path, name: &str) -> bool {
     .is_ok()
 }
 
+/// Local branch names, newest-checked-out first, for shell completion.
+pub fn branch_names(root: &Path) -> Vec<String> {
+    git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--sort=-committerdate",
+            "refs/heads",
+        ],
+    )
+    .map(|s| s.lines().map(str::to_string).collect())
+    .unwrap_or_default()
+}
+
+/// Names of the worktrees living under this repo's `.sprout` namespace — the
+/// ones `sprout` created, as the names you'd pass to `rm`/`path`. Nested names
+/// (`feat/login`) come back with their slashes intact.
+pub fn sprout_worktree_names(main_root: &Path) -> Vec<String> {
+    let namespace = repo_namespace(main_root);
+    let Ok(out) = git(main_root, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .filter_map(|p| Path::new(p).strip_prefix(&namespace).ok())
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 /// The ref a new branch is created from when `--base` isn't given: the repo's
 /// default branch, so worktrees start from `main` regardless of which branch
 /// you happen to be on. Prefers a local `main`, then `master`, then the
@@ -211,8 +261,10 @@ pub fn default_base(root: &Path) -> String {
         }
     }
     // e.g. "origin/HEAD" -> "origin/main"; a valid ref to branch from.
-    if let Ok(sym) = git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        && !sym.is_empty()
+    if let Ok(sym) = git(
+        root,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) && !sym.is_empty()
     {
         return sym;
     }

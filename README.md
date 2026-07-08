@@ -24,6 +24,13 @@ to `/usr/local/bin` (or `~/.local/bin` if that's not writable). Pin a version
 with `SPROUT_VERSION=v0.1.0`, change the destination with
 `SPROUT_INSTALL_DIR=...`.
 
+The installer also wires up your shell rc (`~/.zshrc`, or `~/.bash_profile`
+for bash) so `sprout` is on your `PATH` and [shell integration](#shell-integration)
+(auto-cd + tab completion) works out of the box. It's idempotent — it greps for
+each line first, so re-running never duplicates anything, and a line you'd
+already added by hand is left alone. Set `SPROUT_NO_MODIFY_RC=1` to skip this
+and get the two lines printed for you to add yourself.
+
 ## Usage
 
 ```sh
@@ -33,9 +40,17 @@ sprout switch feat/login         # print path, creating the worktree if needed
 cd "$(sprout path feat/login)"   # jump to it
 sprout main                      # jump back to the main worktree
 sprout list                      # git worktree list (alias: sprout ls)
-sprout rm feat/login             # refuses if tracked files are dirty
-sprout rm feat/login --force
+sprout rm feat/login             # remove worktree + delete branch
+sprout rm feat/login --force     # ...even if dirty / branch unmerged
+sprout rm feat/login --keep-branch  # remove worktree, keep the branch
 ```
+
+`sprout rm` removes the worktree *and* deletes its branch, so you don't have to
+follow up with `git branch -d`. It refuses if the worktree has uncommitted
+changes to tracked files, and — like `git branch -d` — leaves the branch in
+place (with a warning) if it isn't fully merged. `--force` overrides both,
+force-deleting the branch (`git branch -D`); `--keep-branch` removes only the
+worktree.
 
 Interrupting a `new`/`switch` with Ctrl-C tears the half-built worktree back
 down instead of leaving a partial tree behind — so you never end up `cd`'d
@@ -59,8 +74,9 @@ stdout. Slashed branch names nest, mirroring git's own ref storage.
 ### Shell integration
 
 A CLI can't change its parent shell's directory, so `sprout new`,
-`sprout switch`, and `sprout main` print the path instead. To land in the
-worktree automatically, add this to `~/.zshrc` (works in bash too):
+`sprout switch`, and `sprout main` print the path instead. The installer adds
+the line below to your shell rc for you; if you opted out (or build from
+source), add it yourself to `~/.zshrc` (works in bash too):
 
 ```sh
 eval "$(sprout shell-init)"
@@ -68,6 +84,12 @@ eval "$(sprout shell-init)"
 
 Then `sprout switch feat/login` creates the worktree if needed and cd's into
 it, and `sprout main` drops you back in the main checkout.
+
+Tab completion comes with it (zsh and bash). `sprout switch <TAB>` / `sprout
+new <TAB>` complete against your local branches; `sprout rm <TAB>` and
+`sprout path <TAB>` complete against the worktrees sprout has created. (zsh
+completion needs `compinit` loaded — frameworks like oh-my-zsh do this for you;
+on bare zsh add `autoload -Uz compinit && compinit` before the `eval`.)
 
 ## What gets cloned
 

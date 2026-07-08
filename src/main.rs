@@ -32,12 +32,16 @@ enum Cmd {
         #[arg(long)]
         base: Option<String>,
     },
-    /// Remove a worktree created by `sprout new`
+    /// Remove a worktree created by `sprout new`, and delete its branch
     Rm {
         name: String,
-        /// Remove even if there are uncommitted changes to tracked files
+        /// Remove even with uncommitted changes to tracked files, and delete
+        /// the branch even if it isn't fully merged (`git branch -D`)
         #[arg(long)]
         force: bool,
+        /// Remove the worktree but leave its branch in place
+        #[arg(long)]
+        keep_branch: bool,
     },
     /// List this repo's worktrees
     #[command(visible_alias = "ls")]
@@ -56,17 +60,25 @@ enum Cmd {
     },
     /// Print shell integration; add `eval "$(sprout shell-init)"` to ~/.zshrc
     ShellInit,
+    /// Print completion candidates for a subcommand (used by shell completion).
+    #[command(name = "__complete", hide = true)]
+    Complete { target: String },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::New { name, base } => cmd_new(&name, base.as_deref()),
-        Cmd::Rm { name, force } => cmd_rm(&name, force),
+        Cmd::Rm {
+            name,
+            force,
+            keep_branch,
+        } => cmd_rm(&name, force, keep_branch),
         Cmd::List => cmd_list(),
         Cmd::Path { name } => cmd_path(&name),
         Cmd::Main => cmd_main(),
         Cmd::Switch { name, base } => cmd_switch(&name, base.as_deref()),
         Cmd::ShellInit => cmd_shell_init(),
+        Cmd::Complete { target } => cmd_complete(&target),
     }
 }
 
@@ -154,7 +166,10 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
                         let hint = clonefile::explain(&err)
                             .map(|h| format!(" ({h})"))
                             .unwrap_or_default();
-                        p.warn(format!("warn: could not clone {}: {err}{hint}", rel.display()));
+                        p.warn(format!(
+                            "warn: could not clone {}: {err}{hint}",
+                            rel.display()
+                        ));
                     }
                 }
                 p.inc();
@@ -234,7 +249,7 @@ fn abort_worktree(source: &Path, main_root: &Path, dest: &Path) -> ! {
     std::process::exit(130);
 }
 
-fn cmd_rm(name: &str, force: bool) -> Result<()> {
+fn cmd_rm(name: &str, force: bool, keep_branch: bool) -> Result<()> {
     let source = repo::worktree_root()?;
     let main_root = repo::main_repo_root(&source)?;
     let dest = repo::worktree_dir(&main_root, name)?;
@@ -266,6 +281,20 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
     // Drop `.sprout` itself once the last worktree is gone (fails if non-empty).
     let _ = fs::remove_dir(&namespace);
     eprintln!("removed {}", dest.display());
+
+    // Delete the branch too. Must come after the worktree is gone — git refuses
+    // to delete a branch that's still checked out somewhere. `--force` upgrades
+    // `-d` (refuses unmerged) to `-D` (deletes regardless).
+    if !keep_branch && repo::branch_exists(&main_root, name) {
+        match repo::delete_branch(&main_root, name, force) {
+            Ok(()) => eprintln!("deleted branch {name}"),
+            // The worktree — the thing you asked to remove — is already gone, so
+            // a branch we can't safely delete (unmerged, or checked out in
+            // another worktree) is a warning, not a failure. git's own message
+            // already says how to force it.
+            Err(reason) => eprintln!("warning: kept branch '{name}':\n{reason}"),
+        }
+    }
     Ok(())
 }
 
@@ -312,9 +341,39 @@ fn cmd_switch(name: &str, base: Option<&str>) -> Result<()> {
     cmd_new(name, base) // prints the path itself
 }
 
+/// Print candidates for `<TAB>` completion of a subcommand's name argument.
+/// Invoked by the completion functions in `shell-init`, once per keystroke —
+/// so if we're not in a repo (or anything else goes wrong), print nothing and
+/// exit clean rather than leaking an error into the user's prompt.
+fn cmd_complete(target: &str) -> Result<()> {
+    let Ok(source) = repo::worktree_root() else {
+        return Ok(());
+    };
+    let Ok(main_root) = repo::main_repo_root(&source) else {
+        return Ok(());
+    };
+    // `rm`/`path` only act on existing worktrees; `new`/`switch` take any
+    // branch name (switch creates the worktree on demand).
+    let names = match target {
+        "rm" | "path" => repo::sprout_worktree_names(&main_root),
+        _ => repo::branch_names(&main_root),
+    };
+    for n in names {
+        println!("{n}");
+    }
+    Ok(())
+}
+
 fn cmd_shell_init() -> Result<()> {
     // Wrap the binary in a function so `new` and `switch` land you in the
     // worktree. A child process can't change the parent shell's cwd.
+    //
+    // The completion blocks are guarded by $ZSH_VERSION/$BASH_VERSION so each
+    // shell only *runs* its own; the other shell's block still parses because
+    // its foreign syntax (e.g. zsh's `${(f)...}`) fails at runtime, not parse
+    // time, and never runs. Candidate names come from `sprout __complete`, so
+    // the "what to suggest" logic stays in one place (Rust), not duplicated in
+    // two dialects of shell.
     print!(
         r#"sprout() {{
   case "$1" in
@@ -328,6 +387,43 @@ fn cmd_shell_init() -> Result<()> {
       ;;
   esac
 }}
+
+if [ -n "$ZSH_VERSION" ]; then
+  if whence compdef >/dev/null 2>&1; then
+    _sprout() {{
+      if (( CURRENT == 2 )); then
+        compadd -- new switch rm list ls path main shell-init
+        return
+      fi
+      case ${{words[2]}} in
+        new|switch|rm|path)
+          (( CURRENT == 3 )) || return
+          local -a names
+          names=(${{(f)"$(command sprout __complete ${{words[2]}} 2>/dev/null)"}})
+          compadd -- $names
+          ;;
+      esac
+    }}
+    compdef _sprout sprout
+  fi
+elif [ -n "$BASH_VERSION" ]; then
+  _sprout() {{
+    local cur="${{COMP_WORDS[COMP_CWORD]}}"
+    if [ "$COMP_CWORD" -eq 1 ]; then
+      COMPREPLY=( $(compgen -W "new switch rm list ls path main shell-init" -- "$cur") )
+      return
+    fi
+    case "${{COMP_WORDS[1]}}" in
+      new|switch|rm|path)
+        [ "$COMP_CWORD" -eq 2 ] || return
+        local names
+        names="$(command sprout __complete "${{COMP_WORDS[1]}}" 2>/dev/null)"
+        COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+        ;;
+    esac
+  }}
+  complete -F _sprout sprout
+fi
 "#
     );
     Ok(())

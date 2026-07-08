@@ -79,6 +79,21 @@ impl TestEnv {
             .unwrap()
     }
 
+    /// Does the main repo still have a local branch by this name?
+    fn branch_exists(&self, name: &str) -> bool {
+        Command::new("git")
+            .current_dir(&self.repo)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{name}"),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    }
+
     /// Run `sprout`, assert success, return trimmed stdout.
     fn sprout_ok(&self, args: &[&str]) -> String {
         let out = self.sprout(args);
@@ -250,6 +265,153 @@ fn rm_allows_worktree_with_untracked_files_when_tracked_clean() {
     assert!(!wt.exists());
 }
 
+/// Commit a change to a tracked file *inside* a worktree (not the main repo),
+/// leaving that worktree's branch ahead of — and unmerged into — main.
+fn commit_in(wt: &std::path::Path, rel: &str, content: &str) {
+    fs::write(wt.join(rel), content).unwrap();
+    let out = Command::new("git")
+        .current_dir(wt)
+        .args(["commit", "-qam", "work"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rm_deletes_the_branch_by_default() {
+    let env = TestEnv::new();
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat/x"]));
+    assert!(
+        env.branch_exists("feat/x"),
+        "branch created with the worktree"
+    );
+    env.sprout_ok(&["rm", "feat/x"]);
+    assert!(!wt.exists(), "worktree removed");
+    assert!(
+        !env.branch_exists("feat/x"),
+        "rm must delete the branch too"
+    );
+}
+
+#[test]
+fn rm_keep_branch_leaves_the_branch() {
+    let env = TestEnv::new();
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    env.sprout_ok(&["rm", "feat", "--keep-branch"]);
+    assert!(!wt.exists(), "worktree still removed");
+    assert!(
+        env.branch_exists("feat"),
+        "--keep-branch must preserve the branch"
+    );
+}
+
+#[test]
+fn rm_keeps_unmerged_branch_without_force_and_warns() {
+    let env = TestEnv::new();
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    commit_in(&wt, "src/lib.ts", "export const x = 42\n");
+
+    // Safe delete (`git branch -d`) refuses an unmerged branch. The worktree —
+    // what you asked to remove — still goes; the branch is kept with a warning.
+    let out = env.sprout(&["rm", "feat"]);
+    assert!(out.status.success(), "worktree removal must still succeed");
+    assert!(!wt.exists(), "worktree removed");
+    assert!(env.branch_exists("feat"), "unmerged branch must be kept");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("kept branch"),
+        "must warn the branch was kept: {stderr}"
+    );
+}
+
+#[test]
+fn rm_force_deletes_even_an_unmerged_branch() {
+    let env = TestEnv::new();
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    commit_in(&wt, "src/lib.ts", "export const x = 42\n");
+    env.sprout_ok(&["rm", "feat", "--force"]);
+    assert!(!wt.exists(), "worktree removed");
+    assert!(
+        !env.branch_exists("feat"),
+        "--force must delete the unmerged branch"
+    );
+}
+
+#[test]
+fn complete_lists_branches_for_switch_and_worktrees_for_rm() {
+    let env = TestEnv::new();
+    env.git(&["branch", "develop"]);
+    env.sprout_ok(&["new", "feat"]);
+
+    // switch/new complete against every local branch (switch creates the
+    // worktree on demand, so any branch is a valid target).
+    let branches: Vec<String> = env
+        .sprout_ok(&["__complete", "switch"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    for expected in ["main", "develop", "feat"] {
+        assert!(
+            branches.iter().any(|b| b == expected),
+            "switch completion should include '{expected}': {branches:?}"
+        );
+    }
+
+    // rm/path complete only against existing sprout worktrees — not `main` or
+    // `develop`, which have no worktree to remove.
+    let worktrees: Vec<String> = env
+        .sprout_ok(&["__complete", "rm"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        worktrees,
+        vec!["feat"],
+        "rm must complete only sprout worktrees, not every branch"
+    );
+}
+
+#[test]
+fn complete_outside_a_repo_is_silent() {
+    let env = TestEnv::new();
+    // env.root is a bare temp dir, not a git repo: completion runs on every
+    // keystroke, so it must exit clean and print nothing rather than erroring.
+    let out = Command::new(env!("CARGO_BIN_EXE_sprout"))
+        .current_dir(&env.root)
+        .env("HOME", &env.root)
+        .args(["__complete", "switch"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "must exit 0 even outside a repo");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "no candidates outside a repo"
+    );
+}
+
+#[test]
+fn shell_init_registers_completion_for_both_shells() {
+    let env = TestEnv::new();
+    let init = env.sprout_ok(&["shell-init"]);
+    assert!(
+        init.contains("compdef _sprout sprout"),
+        "zsh completion missing"
+    );
+    assert!(
+        init.contains("complete -F _sprout sprout"),
+        "bash completion missing"
+    );
+    assert!(
+        init.contains("__complete"),
+        "completion must call back into the binary"
+    );
+}
+
 #[test]
 fn new_branches_from_default_branch_not_current_branch() {
     let env = TestEnv::new();
@@ -346,7 +508,10 @@ fn malformed_config_is_a_clear_error() {
     let out = env.sprout(&["new", "feat"]);
     assert!(!out.status.success(), "malformed config must fail loudly");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("config.json"), "error must name the file: {stderr}");
+    assert!(
+        stderr.contains("config.json"),
+        "error must name the file: {stderr}"
+    );
 }
 
 #[test]
@@ -366,7 +531,10 @@ fn explicit_base_on_existing_branch_warns_and_checks_out_as_is() {
     // Checked out the existing branch (main's content), not development's.
     let wt = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
     let content = fs::read_to_string(wt.join("src/lib.ts")).unwrap();
-    assert_eq!(content, "export const x = 1\n", "existing branch checked out as-is");
+    assert_eq!(
+        content, "export const x = 1\n",
+        "existing branch checked out as-is"
+    );
 }
 
 #[test]
