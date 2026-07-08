@@ -219,21 +219,6 @@ pub fn branch_exists(root: &Path, name: &str) -> bool {
     .is_ok()
 }
 
-/// Local branch names, newest-checked-out first, for shell completion.
-pub fn branch_names(root: &Path) -> Vec<String> {
-    git(
-        root,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "--sort=-committerdate",
-            "refs/heads",
-        ],
-    )
-    .map(|s| s.lines().map(str::to_string).collect())
-    .unwrap_or_default()
-}
-
 /// Names of the worktrees living under this repo's `.sprout` namespace — the
 /// ones `sprout` created, as the names you'd pass to `rm`/`path`. Nested names
 /// (`feat/login`) come back with their slashes intact.

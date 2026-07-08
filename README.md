@@ -85,11 +85,11 @@ eval "$(sprout shell-init)"
 Then `sprout switch feat/login` creates the worktree if needed and cd's into
 it, and `sprout main` drops you back in the main checkout.
 
-Tab completion comes with it (zsh and bash). `sprout switch <TAB>` / `sprout
-new <TAB>` complete against your local branches; `sprout rm <TAB>` and
-`sprout path <TAB>` complete against the worktrees sprout has created. (zsh
-completion needs `compinit` loaded — frameworks like oh-my-zsh do this for you;
-on bare zsh add `autoload -Uz compinit && compinit` before the `eval`.)
+Tab completion comes with it (zsh and bash). `sprout switch <TAB>`,
+`sprout rm <TAB>`, and `sprout path <TAB>` all complete against the worktrees
+sprout has created. (zsh completion needs `compinit` loaded — frameworks like
+oh-my-zsh do this for you; on bare zsh add `autoload -Uz compinit && compinit`
+before the `eval`.)
 
 ## What gets cloned
 

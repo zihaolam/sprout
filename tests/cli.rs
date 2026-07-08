@@ -342,36 +342,39 @@ fn rm_force_deletes_even_an_unmerged_branch() {
 }
 
 #[test]
-fn complete_lists_branches_for_switch_and_worktrees_for_rm() {
+fn complete_lists_worktrees_not_branches() {
     let env = TestEnv::new();
-    env.git(&["branch", "develop"]);
-    env.sprout_ok(&["new", "feat"]);
+    env.git(&["branch", "develop"]); // a branch with no worktree
+    env.sprout_ok(&["new", "feat/x"]);
+    env.sprout_ok(&["new", "bugfix"]);
 
-    // switch/new complete against every local branch (switch creates the
-    // worktree on demand, so any branch is a valid target).
-    let branches: Vec<String> = env
-        .sprout_ok(&["__complete", "switch"])
-        .lines()
-        .map(str::to_string)
-        .collect();
-    for expected in ["main", "develop", "feat"] {
+    // switch/rm/path all complete against the worktrees sprout created — never
+    // plain branches (`develop`) or the main checkout (`main`).
+    for sub in ["switch", "rm", "path"] {
+        let names: Vec<String> = env
+            .sprout_ok(&["__complete", sub])
+            .lines()
+            .map(str::to_string)
+            .collect();
         assert!(
-            branches.iter().any(|b| b == expected),
-            "switch completion should include '{expected}': {branches:?}"
+            names.iter().any(|n| n == "feat/x"),
+            "{sub} completion should include worktree 'feat/x': {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "bugfix"),
+            "{sub} completion should include worktree 'bugfix': {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "develop" || n == "main"),
+            "{sub} must not suggest branches without a worktree: {names:?}"
         );
     }
 
-    // rm/path complete only against existing sprout worktrees — not `main` or
-    // `develop`, which have no worktree to remove.
-    let worktrees: Vec<String> = env
-        .sprout_ok(&["__complete", "rm"])
-        .lines()
-        .map(str::to_string)
-        .collect();
+    // `new` takes a fresh name — nothing to suggest.
     assert_eq!(
-        worktrees,
-        vec!["feat"],
-        "rm must complete only sprout worktrees, not every branch"
+        env.sprout_ok(&["__complete", "new"]),
+        "",
+        "new must not complete existing names"
     );
 }
 

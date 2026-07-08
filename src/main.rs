@@ -352,11 +352,12 @@ fn cmd_complete(target: &str) -> Result<()> {
     let Ok(main_root) = repo::main_repo_root(&source) else {
         return Ok(());
     };
-    // `rm`/`path` only act on existing worktrees; `new`/`switch` take any
-    // branch name (switch creates the worktree on demand).
+    // `switch`/`rm`/`path` all act on an existing worktree, so complete against
+    // the worktrees sprout has created — not every git branch. (`new` takes a
+    // fresh name, so there's nothing useful to suggest for it.)
     let names = match target {
-        "rm" | "path" => repo::sprout_worktree_names(&main_root),
-        _ => repo::branch_names(&main_root),
+        "switch" | "rm" | "path" => repo::sprout_worktree_names(&main_root),
+        _ => Vec::new(),
     };
     for n in names {
         println!("{n}");
@@ -396,7 +397,7 @@ if [ -n "$ZSH_VERSION" ]; then
         return
       fi
       case ${{words[2]}} in
-        new|switch|rm|path)
+        switch|rm|path)
           (( CURRENT == 3 )) || return
           local -a names
           names=(${{(f)"$(command sprout __complete ${{words[2]}} 2>/dev/null)"}})
@@ -414,7 +415,7 @@ elif [ -n "$BASH_VERSION" ]; then
       return
     fi
     case "${{COMP_WORDS[1]}}" in
-      new|switch|rm|path)
+      switch|rm|path)
         [ "$COMP_CWORD" -eq 2 ] || return
         local names
         names="$(command sprout __complete "${{COMP_WORDS[1]}}" 2>/dev/null)"
