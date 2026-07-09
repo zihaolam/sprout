@@ -1,11 +1,13 @@
 //! Ctrl-C handling for the worktree-building path.
 //!
 //! `sprout new`/`switch` create a worktree and then CoW-clone a potentially
-//! large ignored tree into it. If that's interrupted, the default SIGINT
+//! large ignored tree for it. If that's interrupted, the default SIGINT
 //! (terminate) leaves a half-built worktree behind — which `switch` would then
 //! happily `cd` into next time. So we install a handler that flips a flag the
-//! clone loop polls, letting us tear the partial worktree down and exit
-//! cleanly. A *second* Ctrl-C restores the default handler, so it hard-quits.
+//! clone loop polls, letting us back out cleanly: abandon the staged clone to
+//! a detached sweeper, remove the tracked-files-only checkout, and exit —
+//! near-instant. A *second* Ctrl-C restores the default handler, so it
+//! hard-quits.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

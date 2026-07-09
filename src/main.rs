@@ -4,11 +4,12 @@ mod progress;
 mod repo;
 mod scrub;
 mod signal;
+mod stage;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -63,6 +64,13 @@ enum Cmd {
     /// Print completion candidates for a subcommand (used by shell completion).
     #[command(name = "__complete", hide = true)]
     Complete { target: String },
+    /// Delete abandoned staging directories (internal; spawned detached so
+    /// big trees vanish in the background instead of blocking the prompt).
+    #[command(name = "__sweep", hide = true)]
+    Sweep {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -79,6 +87,10 @@ fn main() -> Result<()> {
         Cmd::Switch { name, base } => cmd_switch(&name, base.as_deref()),
         Cmd::ShellInit => cmd_shell_init(),
         Cmd::Complete { target } => cmd_complete(&target),
+        Cmd::Sweep { paths } => {
+            stage::run_sweeper(&paths);
+            Ok(())
+        }
     }
 }
 
@@ -126,17 +138,68 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
     // A Ctrl-C during `git worktree add` shows up as a git failure; back out
     // cleanly rather than surfacing it as an error.
     if signal::triggered() {
-        abort_worktree(&source, &main_root, &dest);
+        abort_worktree(&source, &main_root, &dest, None);
     }
     let out = added?;
     if !out.is_empty() {
         eprintln!("{out}");
     }
 
-    // 2. CoW-clone everything git ignores (node_modules, caches, .env, ...),
-    //    with a spinner on stderr so slow clones don't look frozen.
+    // 2. CoW-clone everything git ignores (node_modules, caches, .env, ...)
+    //    into a staging directory, then promote into the worktree with one
+    //    rename per entry. The worktree never holds a partial clone, and a
+    //    Ctrl-C costs nothing: staging is abandoned to a detached sweeper
+    //    and only the tracked-files-only checkout needs removing.
+    let namespace = repo::repo_namespace(&main_root);
+    stage::sweep(&namespace); // reap leftovers from earlier interrupted runs
+    let staging = stage::slot(&namespace, name)?;
+    fs::create_dir(&staging)?;
+
     let started = Instant::now();
-    let entries = repo::ignored_entries(&source)?;
+    let stats = match build_ignored_state(&source, &dest, &staging) {
+        Ok(Some(stats)) => stats,
+        // Ctrl-C mid-build: exit now, delete the big staged tree lazily.
+        Ok(None) => abort_worktree(&source, &main_root, &dest, Some(&staging)),
+        // A real error: same cleanup, but surface what went wrong.
+        Err(err) => {
+            stage::discard(&staging);
+            teardown_worktree(&source, &main_root, &dest);
+            return Err(err);
+        }
+    };
+
+    eprintln!(
+        "cloned {} ignored entr{} in {:.2?}{}{}",
+        stats.cloned,
+        if stats.cloned == 1 { "y" } else { "ies" },
+        started.elapsed(),
+        if stats.scrubbed > 0 {
+            format!(", scrubbed {}", stats.scrubbed)
+        } else {
+            String::new()
+        },
+        if stats.failed > 0 {
+            format!(", {} failed", stats.failed)
+        } else {
+            String::new()
+        },
+    );
+    // Path on stdout so `cd "$(sprout new foo)"` works.
+    println!("{}", dest.display());
+    Ok(())
+}
+
+struct BuildStats {
+    cloned: u64,
+    failed: u64,
+    scrubbed: u64,
+}
+
+/// Clone every ignored entry into `staging` (with a spinner), scrub it there,
+/// then promote into `dest` — one rename per entry, near-instant. Returns
+/// `Ok(None)` on Ctrl-C, leaving `staging` for the caller to discard.
+fn build_ignored_state(source: &Path, dest: &Path, staging: &Path) -> Result<Option<BuildStats>> {
+    let entries = repo::ignored_entries(source)?;
     let (cloned, failed, interrupted) =
         progress::with_spinner(entries.len(), |p| -> Result<(u64, u64, bool)> {
             let mut cloned = 0u64;
@@ -148,7 +211,7 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
                 }
                 p.set(rel.display());
                 let src = source.join(rel);
-                let dst = dest.join(rel);
+                let dst = staging.join(rel);
                 if let Some(parent) = dst.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -181,35 +244,44 @@ fn cmd_new(name: &str, base: Option<&str>) -> Result<()> {
         })?;
 
     if interrupted {
-        abort_worktree(&source, &main_root, &dest);
+        return Ok(None);
     }
 
-    // 3. Scrub whatever .sproutignore says to drop.
+    // Scrub whatever .sproutignore says to drop — in staging, before
+    // promotion, so scrubbed paths never touch the worktree at all.
     let mut scrubbed = 0u64;
-    if let Some(matcher) = scrub::load(&source, &dest)? {
+    if let Some(matcher) = scrub::load(source, staging)? {
         for rel in &entries {
-            scrubbed += scrub::scrub_entry(&matcher, &dest, rel)?;
+            scrubbed += scrub::scrub_entry(&matcher, staging, rel)?;
         }
     }
 
-    eprintln!(
-        "cloned {cloned} ignored entr{} in {:.2?}{}{}",
-        if cloned == 1 { "y" } else { "ies" },
-        started.elapsed(),
-        if scrubbed > 0 {
-            format!(", scrubbed {scrubbed}")
-        } else {
-            String::new()
-        },
-        if failed > 0 {
-            format!(", {failed} failed")
-        } else {
-            String::new()
-        },
-    );
-    // Path on stdout so `cd "$(sprout new foo)"` works.
-    println!("{}", dest.display());
-    Ok(())
+    // Last cheap out for a straggling Ctrl-C. From here promotion runs to
+    // completion (milliseconds): interrupting it would leave a torn worktree,
+    // finishing it leaves a complete one.
+    if signal::triggered() {
+        return Ok(None);
+    }
+    for rel in &entries {
+        let src = staging.join(rel);
+        // Absent: the clone failed (warned above) or the entry was scrubbed.
+        if fs::symlink_metadata(&src).is_err() {
+            continue;
+        }
+        let dst = dest.join(rel);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&src, &dst)
+            .with_context(|| format!("failed to move {} into the worktree", rel.display()))?;
+    }
+    // All that's left of staging is empty parent-directory skeletons.
+    let _ = fs::remove_dir_all(staging);
+    Ok(Some(BuildStats {
+        cloned,
+        failed,
+        scrubbed,
+    }))
 }
 
 /// The base ref for a *new* branch, in precedence order: an explicit `--base`,
@@ -225,15 +297,30 @@ fn resolve_base(flag: Option<&str>, source: &Path, main_root: &Path) -> Result<S
     Ok(repo::default_base(source))
 }
 
-/// Tear down a worktree we were partway through building (Ctrl-C) and exit.
-/// Nothing lands on stdout, so the shell wrapper's `cd` never fires. Leaves the
-/// tree as tidy as `rm` would: no orphaned `.sprout` entry behind.
-fn abort_worktree(source: &Path, main_root: &Path, dest: &Path) -> ! {
+/// Back out of a worktree we were partway through building (Ctrl-C) and exit.
+/// Nothing lands on stdout, so the shell wrapper's `cd` never fires. Returns
+/// the prompt immediately: the big staged clone is handed to a detached
+/// sweeper, and the worktree itself holds only tracked files at this point.
+fn abort_worktree(source: &Path, main_root: &Path, dest: &Path, staging: Option<&Path>) -> ! {
+    if let Some(s) = staging {
+        stage::discard(s);
+    }
     // Interrupted before the worktree was even created (during setup): nothing
     // to tear down.
     if !dest.exists() {
         eprintln!("aborted");
         std::process::exit(130);
+    }
+    teardown_worktree(source, main_root, dest);
+    eprintln!("aborted: removed partial worktree {}", dest.display());
+    std::process::exit(130);
+}
+
+/// Remove a worktree and its git bookkeeping, leaving the tree as tidy as
+/// `rm` would: no orphaned `.sprout` entry behind.
+fn teardown_worktree(source: &Path, main_root: &Path, dest: &Path) {
+    if !dest.exists() {
+        return;
     }
     let dest_str = dest.to_string_lossy();
     // Prefer git so the `.git/worktrees/<name>` admin entry goes too; fall back
@@ -244,9 +331,8 @@ fn abort_worktree(source: &Path, main_root: &Path, dest: &Path) -> ! {
     }
     let namespace = repo::repo_namespace(main_root);
     repo::prune_empty_parents(&namespace, dest);
+    stage::tidy_local_root(&namespace);
     let _ = fs::remove_dir(&namespace); // only if this was the last worktree
-    eprintln!("aborted: removed partial worktree {}", dest.display());
-    std::process::exit(130);
 }
 
 fn cmd_rm(name: &str, force: bool, keep_branch: bool) -> Result<()> {
@@ -256,6 +342,11 @@ fn cmd_rm(name: &str, force: bool, keep_branch: bool) -> Result<()> {
 
     if !dest.exists() {
         bail!("no worktree at {}", dest.display());
+    }
+    // `git worktree remove` used to refuse this for us; now that removal is a
+    // rename, guard against yanking the directory out from under the shell.
+    if fs::canonicalize(&source)? == fs::canonicalize(&dest)? {
+        bail!("cannot remove '{name}' from inside it — cd out first (e.g. `sprout main`)");
     }
 
     // Our worktrees always contain untracked files (that's the point), so
@@ -270,14 +361,29 @@ fn cmd_rm(name: &str, force: bool, keep_branch: bool) -> Result<()> {
         }
     }
 
-    // Removing the tree (a big cloned node_modules and friends) can take a
-    // beat, so animate a spinner. Capture git's output to keep the line clean.
-    let dest_str = dest.to_string_lossy();
-    progress::with_message(&format!("removing {name}"), || {
-        repo::git(&source, &["worktree", "remove", "--force", &dest_str])
-    })?;
     let namespace = repo::repo_namespace(&main_root);
+    stage::sweep(&namespace); // reap leftovers from earlier interrupted runs
+    // Deleting a big cloned tree is O(files); renaming it is one syscall.
+    // Move the worktree into staging, drop git's bookkeeping, and let a
+    // detached sweeper delete it behind the scenes — the prompt comes back
+    // immediately no matter how big node_modules is.
+    match stage::slot(&namespace, name) {
+        Ok(trash) if fs::rename(&dest, &trash).is_ok() => {
+            // The admin entry now points at a missing dir; prune drops it.
+            let _ = repo::git(&source, &["worktree", "prune"]);
+            stage::discard(&trash);
+        }
+        // Rename refused (odd mounts, permissions): delete in place, with a
+        // spinner since a big cloned tree can take a beat.
+        _ => {
+            let dest_str = dest.to_string_lossy();
+            progress::with_message(&format!("removing {name}"), || {
+                repo::git(&source, &["worktree", "remove", "--force", &dest_str])
+            })?;
+        }
+    }
     repo::prune_empty_parents(&namespace, &dest);
+    stage::tidy_local_root(&namespace);
     // Drop `.sprout` itself once the last worktree is gone (fails if non-empty).
     let _ = fs::remove_dir(&namespace);
     eprintln!("removed {}", dest.display());

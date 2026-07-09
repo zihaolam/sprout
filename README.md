@@ -52,9 +52,17 @@ place (with a warning) if it isn't fully merged. `--force` overrides both,
 force-deleting the branch (`git branch -D`); `--keep-branch` removes only the
 worktree.
 
-Interrupting a `new`/`switch` with Ctrl-C tears the half-built worktree back
-down instead of leaving a partial tree behind — so you never end up `cd`'d
-into an incomplete checkout. Press it again to hard-quit.
+Interrupting a `new`/`switch` with Ctrl-C backs out immediately instead of
+leaving a partial tree behind — so you never end up `cd`'d into an incomplete
+checkout. Press it again to hard-quit. Like `bun install`, cancelling costs
+nothing: ignored state is cloned into a staging directory and promoted into
+the worktree with atomic renames only once complete, so aborting just abandons
+staging to a detached background sweeper. `sprout rm` uses the same trick in
+reverse — the worktree is renamed away instantly and deleted behind the
+scenes, so the prompt returns immediately no matter how big `node_modules`
+is. Abandoned staging entries are reaped on later runs (and, since staging
+lives in the system temp dir, by the OS's own temp cleaning as a last
+resort).
 
 New branches are created from the repo's default branch (`main`, else
 `master`, else `origin/HEAD`) — not whatever branch you're currently on — so a

@@ -13,6 +13,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 struct TestEnv {
     root: PathBuf, // temp root (also HOME)
     repo: PathBuf,
+    tmp: PathBuf, // per-test TMPDIR, so staging assertions don't race other tests
 }
 
 impl TestEnv {
@@ -23,8 +24,10 @@ impl TestEnv {
         // macOS temp_dir is /var/..., a symlink; git reports /private/var/...
         let root = root.canonicalize().unwrap();
         let repo = root.join("repo");
+        let tmp = root.join("tmp");
         fs::create_dir_all(&repo).unwrap();
-        let env = TestEnv { root, repo };
+        fs::create_dir_all(&tmp).unwrap();
+        let env = TestEnv { root, repo, tmp };
 
         env.git(&["init", "-qb", "main"]);
         env.git(&["config", "user.email", "t@t"]);
@@ -74,9 +77,22 @@ impl TestEnv {
         Command::new(env!("CARGO_BIN_EXE_sprout"))
             .current_dir(&self.repo)
             .env("HOME", &self.root)
+            .env("TMPDIR", &self.tmp)
             .args(args)
             .output()
             .unwrap()
+    }
+
+    /// The staging root sprout uses under this test's TMPDIR.
+    fn staging_root(&self) -> PathBuf {
+        self.tmp.join("sprout-staging")
+    }
+
+    /// Number of entries currently staged (0 if the root doesn't exist yet).
+    fn staged_entries(&self) -> usize {
+        fs::read_dir(self.staging_root())
+            .map(|d| d.count())
+            .unwrap_or(0)
     }
 
     /// Does the main repo still have a local branch by this name?
@@ -595,4 +611,97 @@ fn clone_is_cow_writes_do_not_leak_back_to_source() {
     )
     .unwrap();
     assert_eq!(src, "module.exports = 1\n", "source must be unaffected");
+}
+
+/// Poll for an eventually-true condition (detached sweepers run in the
+/// background, so assertions about their effects can't be immediate).
+fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn new_builds_via_staging_and_leaves_none_behind() {
+    let env = TestEnv::new();
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    // promotion happened: cloned state is in the worktree...
+    assert!(wt.join("node_modules/.pnpm").is_dir());
+    // ...and nothing was orphaned in either staging root
+    assert_eq!(env.staged_entries(), 0, "no staged entries after success");
+    assert!(
+        !env.repo.join(".sprout/.staging").exists(),
+        "local fallback root should be unused when TMPDIR shares the volume"
+    );
+}
+
+#[test]
+fn rm_returns_instantly_and_deletes_in_background() {
+    let env = TestEnv::new();
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    env.sprout_ok(&["rm", "feat"]);
+
+    // The old path is gone the moment rm returns (rename, not delete)...
+    assert!(!wt.exists(), "worktree path must vanish immediately");
+    // ...git bookkeeping is pruned, so the name is immediately reusable...
+    env.sprout_ok(&["new", "feat"]);
+    // ...and the trashed tree is deleted behind the scenes.
+    wait_until("trashed worktree to be swept", || env.staged_entries() == 0);
+}
+
+#[test]
+fn sweep_reaps_staging_leftovers_from_dead_processes() {
+    let env = TestEnv::new();
+    // A leftover from a "previous run" whose pid can't exist (macOS pids top
+    // out around 1e5, Linux around 4e6).
+    let junk = env.staging_root().join(format!("{}.stale", i32::MAX));
+    fs::create_dir_all(junk.join("node_modules")).unwrap();
+    fs::write(junk.join("node_modules/big.js"), "x").unwrap();
+
+    env.sprout_ok(&["new", "feat"]); // any mutating command sweeps on entry
+    wait_until("stale staging entry to be reaped", || !junk.exists());
+}
+
+#[test]
+fn rm_refuses_to_remove_the_worktree_you_are_inside() {
+    let env = TestEnv::new();
+    let wt = PathBuf::from(env.sprout_ok(&["new", "feat"]));
+    let out = Command::new(env!("CARGO_BIN_EXE_sprout"))
+        .current_dir(&wt)
+        .env("HOME", &env.root)
+        .env("TMPDIR", &env.tmp)
+        .args(["rm", "feat"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "rm from inside the worktree must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("inside"), "stderr should say why: {stderr}");
+    assert!(wt.exists(), "worktree must be untouched");
+}
+
+#[test]
+fn sweeper_ignores_paths_outside_staging_roots() {
+    let env = TestEnv::new();
+    let precious = env.root.join("precious");
+    fs::create_dir_all(&precious).unwrap();
+    fs::write(precious.join("keep.txt"), "keep\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sprout"))
+        .current_dir(&env.repo)
+        .env("HOME", &env.root)
+        .env("TMPDIR", &env.tmp)
+        .args(["__sweep", precious.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        precious.join("keep.txt").is_file(),
+        "__sweep must refuse paths outside its staging roots"
+    );
 }
